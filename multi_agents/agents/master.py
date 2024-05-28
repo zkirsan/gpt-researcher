@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from langgraph.graph import StateGraph, END
 from .utils.views import print_agent_output
 from memory.research import ResearchState
@@ -11,11 +12,16 @@ from . import \
     PublisherAgent, \
     ResearchAgent
 
+# Function to sanitize filenames
+def sanitize_filename(filename):
+    # Replace invalid characters with an underscore
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
 class ChiefEditorAgent:
     def __init__(self, task: dict):
         self.task_id = int(time.time()) # Currently time based, but can be any unique identifier
-        self.output_dir = f"./outputs/run_{self.task_id}_{task.get('query')[0:40]}"
+        sanitized_query = sanitize_filename(task.get('query', '')[:40])
+        self.output_dir = f"./outputs/run_{self.task_id}_{sanitized_query}"
         self.task = task
         os.makedirs(self.output_dir, exist_ok=True)
 

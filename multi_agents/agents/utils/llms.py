@@ -1,4 +1,8 @@
-from langchain.adapters.openai import convert_openai_messages
+# Old import (deprecated)
+# from langchain.adapters.openai import convert_openai_messages
+
+# New import
+from langchain_community.adapters.openai import convert_openai_messages
 from langchain_openai import ChatOpenAI
 
 

@@ -2,11 +2,13 @@ import asyncio
 import json
 
 import markdown
+import re
 
 from gpt_researcher.master.prompts import *
 from gpt_researcher.scraper.scraper import Scraper
 from gpt_researcher.utils.llm import *
 
+import json_repair
 
 def get_retriever(retriever):
     """
@@ -19,9 +21,6 @@ def get_retriever(retriever):
 
     """
     match retriever:
-        case "tavily":
-            from gpt_researcher.retrievers import TavilySearch
-            retriever = TavilySearch
         case "google":
             from gpt_researcher.retrievers import GoogleSearch
             retriever = GoogleSearch
@@ -40,6 +39,12 @@ def get_retriever(retriever):
         case "bing":
             from gpt_researcher.retrievers import BingSearch
             retriever = BingSearch
+        case "tavily":
+            from gpt_researcher.retrievers import TavilySearch
+            retriever = TavilySearch
+        case "custom":
+            from gpt_researcher.retrievers import CustomRetriever
+            retriever = CustomRetriever
 
         case _:
             raise Exception("Retriever not found.")
@@ -47,14 +52,15 @@ def get_retriever(retriever):
     return retriever
 
 
-async def choose_agent(query, cfg, parent_query=None):
+async def choose_agent(query, cfg, parent_query=None, cost_callback: callable = None):
     """
     Chooses the agent automatically
     Args:
         parent_query: In some cases the research is conducted on a subtopic from the main query.
-        Tge parent query allows the agent to know the main context for better reasoning.
+        The parent query allows the agent to know the main context for better reasoning.
         query: original query
         cfg: Config
+        cost_callback: callback for calculating llm costs
 
     Returns:
         agent: Agent name
@@ -68,21 +74,58 @@ async def choose_agent(query, cfg, parent_query=None):
                 {"role": "system", "content": f"{auto_agent_instructions()}"},
                 {"role": "user", "content": f"task: {query}"}],
             temperature=0,
-            llm_provider=cfg.llm_provider
+            llm_provider=cfg.llm_provider,
+            llm_kwargs=cfg.llm_kwargs,
+            cost_callback=cost_callback
         )
+
         agent_dict = json.loads(response)
         return agent_dict["server"], agent_dict["agent_role_prompt"]
+    
     except Exception as e:
-        return "Default Agent", "You are an AI critical thinker research assistant. Your sole purpose is to write well written, critically acclaimed, objective and structured reports on given text."
+        print("⚠️ Error in reading JSON, attempting to repair JSON")
+        return await handle_json_error(response)
+
+async def handle_json_error(response):
+    try:
+        agent_dict = json_repair.loads(response)
+        if agent_dict.get("server") and agent_dict.get("agent_role_prompt"):
+            return agent_dict["server"], agent_dict["agent_role_prompt"]
+    except Exception as e:
+        print(f"Error using json_repair: {e}")
+
+    json_string = extract_json_with_regex(response)
+    if json_string:
+        try:
+            json_data = json.loads(json_string)
+            return json_data["server"], json_data["agent_role_prompt"]
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e}")
+
+    print("No JSON found in the string. Falling back to Default Agent.")
+    return "Default Agent", (
+        "You are an AI critical thinker research assistant. Your sole purpose is to write well written, "
+        "critically acclaimed, objective and structured reports on given text."
+    )
+
+def extract_json_with_regex(response):
+    json_match = re.search(r'{.*?}', response, re.DOTALL)
+    if json_match:
+        return json_match.group(0)
+    return None
 
 
-async def get_sub_queries(query: str, agent_role_prompt: str, cfg, parent_query: str, report_type: str):
+async def get_sub_queries(query: str, agent_role_prompt: str, cfg, parent_query: str,
+                          report_type: str, cost_callback: callable = None):
     """
     Gets the sub queries
     Args:
         query: original query
         agent_role_prompt: agent role prompt
         cfg: Config
+        parent_query:
+        report_type:
+        cost_callback:
 
     Returns:
         sub_queries: List of sub queries
@@ -95,12 +138,13 @@ async def get_sub_queries(query: str, agent_role_prompt: str, cfg, parent_query:
             {"role": "system", "content": f"{agent_role_prompt}"},
             {"role": "user", "content": generate_search_queries_prompt(query, parent_query, report_type, max_iterations=max_research_iterations)}],
         temperature=0,
-        llm_provider=cfg.llm_provider
+        llm_provider=cfg.llm_provider,
+        llm_kwargs=cfg.llm_kwargs,
+        cost_callback=cost_callback
     )
 
-    print("response : ", response)
+    sub_queries = json_repair.loads(response)
 
-    sub_queries = json.loads(response)
     return sub_queries
 
 
@@ -123,8 +167,9 @@ def scrape_urls(urls, cfg=None):
         print(f"{Fore.RED}Error in scrape_urls: {e}{Style.RESET_ALL}")
     return content
 
-
-async def summarize(query, content, agent_role_prompt, cfg, websocket=None):
+# Deprecated: Instead of summaries using ContextualRetriever embedding.
+# This exists in case we decide to modify in the future
+async def summarize(query, content, agent_role_prompt, cfg, websocket=None, cost_callback: callable = None):
     """
     Asynchronously summarizes a list of URLs.
 
@@ -140,7 +185,7 @@ async def summarize(query, content, agent_role_prompt, cfg, websocket=None):
 
     # Function to handle each summarization task for a chunk
     async def handle_task(url, chunk):
-        summary = await summarize_url(query, chunk, agent_role_prompt, cfg)
+        summary = await summarize_url(query, chunk, agent_role_prompt, cfg, cost_callback)
         if summary:
             await stream_output("logs", f"🌐 Summarizing url: {url}", websocket)
             await stream_output("logs", f"📃 {summary}", websocket)
@@ -174,7 +219,7 @@ async def summarize(query, content, agent_role_prompt, cfg, websocket=None):
     return concatenated_summaries
 
 
-async def summarize_url(query, raw_data, agent_role_prompt, cfg):
+async def summarize_url(query, raw_data, agent_role_prompt, cfg, cost_callback: callable = None):
     """
     Summarizes the text
     Args:
@@ -182,6 +227,7 @@ async def summarize_url(query, raw_data, agent_role_prompt, cfg):
         raw_data:
         agent_role_prompt:
         cfg:
+        cost_callback
 
     Returns:
         summary: str
@@ -195,7 +241,9 @@ async def summarize_url(query, raw_data, agent_role_prompt, cfg):
                 {"role": "system", "content": f"{agent_role_prompt}"},
                 {"role": "user", "content": f"{generate_summary_prompt(query, raw_data)}"}],
             temperature=0,
-            llm_provider=cfg.llm_provider
+            llm_provider=cfg.llm_provider,
+            llm_kwargs=cfg.llm_kwargs,
+            cost_callback=cost_callback
         )
     except Exception as e:
         print(f"{Fore.RED}Error in summarize: {e}{Style.RESET_ALL}")
@@ -211,7 +259,8 @@ async def generate_report(
     websocket,
     cfg,
     main_topic: str = "",
-    existing_headers: list = []
+    existing_headers: list = [],
+    cost_callback: callable = None
 ):
     """
     generates the final report
@@ -224,6 +273,7 @@ async def generate_report(
         cfg:
         main_topic:
         existing_headers:
+        cost_callback:
 
     Returns:
         report:
@@ -247,7 +297,9 @@ async def generate_report(
             llm_provider=cfg.llm_provider,
             stream=True,
             websocket=websocket,
-            max_tokens=cfg.smart_token_limit
+            max_tokens=cfg.smart_token_limit,
+            llm_kwargs=cfg.llm_kwargs,
+            cost_callback=cost_callback
         )
     except Exception as e:
         print(f"{Fore.RED}Error in generate_report: {e}{Style.RESET_ALL}")
@@ -272,7 +324,7 @@ async def stream_output(type, output, websocket=None, logging=True):
         await websocket.send_json({"type": type, "output": output})
 
 
-async def get_report_introduction(query, context, role, config, websocket=None):
+async def get_report_introduction(query, context, role, config, websocket=None, cost_callback: callable = None):
     try:
         introduction = await create_chat_completion(
             model=config.smart_llm_model,
@@ -283,7 +335,9 @@ async def get_report_introduction(query, context, role, config, websocket=None):
             llm_provider=config.llm_provider,
             stream=True,
             websocket=websocket,
-            max_tokens=config.smart_token_limit
+            max_tokens=config.smart_token_limit,
+            llm_kwargs=config.llm_kwargs,
+            cost_callback=cost_callback
         )
 
         return introduction
@@ -304,7 +358,7 @@ def extract_headers(markdown_text: str):
     stack = []  # Initialize stack to keep track of nested headers
     for line in lines:
         # Check if the line starts with an HTML header tag
-        if line.startswith("<h") and len(line) > 1:
+        if line.startswith("<h") and len(line) > 2 and line[2].isdigit():
             level = int(line[2])  # Extract header level
             header_text = line[
                 line.index(">") + 1: line.rindex("<")
